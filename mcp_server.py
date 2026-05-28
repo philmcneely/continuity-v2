@@ -38,11 +38,11 @@ mcp = FastMCP("continuity-v2")
 # Hybrid scoring weights for find_similar
 # final_score = W_SEMANTIC*cos_sim + W_RECENCY*recency + W_COMPLEXITY*complexity
 # ---------------------------------------------------------------------------
-_W_SEMANTIC          = 0.7
-_W_RECENCY           = 0.2
-_W_COMPLEXITY        = 0.1
-_RECENCY_DECAY_DAYS  = 365   # linear falloff; 0.0 at this many days old
-_COMPLEXITY_MAX_TURNS = 50   # session with this many turns scores 1.0 complexity
+_W_SEMANTIC = 0.7
+_W_RECENCY = 0.2
+_W_COMPLEXITY = 0.1
+_RECENCY_DECAY_DAYS = 365  # linear falloff; 0.0 at this many days old
+_COMPLEXITY_MAX_TURNS = 50  # session with this many turns scores 1.0 complexity
 
 
 def _recency_score(started_at_str: str | None) -> float:
@@ -65,6 +65,7 @@ def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
+
         _model = SentenceTransformer("all-MiniLM-L6-v2")
     return _model
 
@@ -82,7 +83,13 @@ def _connect():
 
 
 @mcp.tool()
-def search_sessions(query: str, limit: int = 10, project: str | None = None, source: str | None = None):
+def search_sessions(
+    query: str,
+    limit: int = 10,
+    project: str | None = None,
+    source: str | None = None,
+    node: str | None = None,
+):
     """Full-text search across Claude Code sessions AND claude.ai chat conversations.
 
     Uses SQLite FTS5. Supports AND/OR/NOT, quoted phrases, prefix* matching.
@@ -91,20 +98,19 @@ def search_sessions(query: str, limit: int = 10, project: str | None = None, sou
     Args:
         query: FTS5 query string.
         limit: Max results (default 10).
-        project: Optional substring filter on project name (e.g. "C--dev",
-                 "chat.claude.ai").
-        source: Optional filter -- "code" for Claude Code sessions only,
-                "chat" for claude.ai conversations only. Omit for both.
+        project: Optional substring filter on project name.
+        source: Optional filter -- "code" or "chat". Omit for both.
+        node: Optional filter by fleet node name (e.g. "kirk", "mac-studio").
 
     Returns:
-        Plain-text list of matches: timestamp, role, project, ai_title,
+        Plain-text list of matches with node, timestamp, role, project, title,
         session id, turn index, and a >>>highlighted<<< snippet.
     """
     conn = _connect()
     sql = """
         SELECT
             t.session_id, t.turn_idx, t.ts, t.role,
-            s.project, s.ai_title,
+            s.project, s.ai_title, s.node,
             snippet(turns_fts, 0, '>>>', '<<<', '...', 24) AS snip
         FROM turns_fts
         JOIN turns t ON t.id = turns_fts.rowid
@@ -118,6 +124,9 @@ def search_sessions(query: str, limit: int = 10, project: str | None = None, sou
     if source:
         sql += " AND s.source = ?"
         params.append(source)
+    if node:
+        sql += " AND s.node = ?"
+        params.append(node)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
 
@@ -136,8 +145,9 @@ def search_sessions(query: str, limit: int = 10, project: str | None = None, sou
     for r in rows:
         ts = (r["ts"] or "")[:19].replace("T", " ")
         title = r["ai_title"] or "(no title)"
+        nd = r["node"] or "local"
         out.append(
-            f"[{ts}] {r['role']:9} | {r['project']} | {title}\n"
+            f"[{ts}] {r['role']:9} | {nd} | {r['project']} | {title}\n"
             f"  session: {r['session_id']}  turn: {r['turn_idx']}\n"
             f"  {r['snip']}"
         )
@@ -171,9 +181,11 @@ def recall_session(
         return f"No session matching: {session_id}"
 
     sid = s["id"]
+    nd = s["node"] if "node" in s.keys() else "local"
     header = (
         f"=== {s['ai_title'] or '(no title)'} ===\n"
         f"session: {sid}\n"
+        f"node:    {nd}\n"
         f"project: {s['project']}  cwd: {s['cwd']}\n"
         f"started: {s['started_at']}  ended: {s['ended_at']}\n"
         f"turns:   {s['turn_count']}\n"
@@ -197,7 +209,12 @@ def recall_session(
 
 
 @mcp.tool()
-def recent_sessions(n: int = 10, project: str | None = None, source: str | None = None):
+def recent_sessions(
+    n: int = 10,
+    project: str | None = None,
+    source: str | None = None,
+    node: str | None = None,
+):
     """List the N most recent sessions across Claude Code and claude.ai chat.
 
     Args:
@@ -206,15 +223,13 @@ def recent_sessions(n: int = 10, project: str | None = None, source: str | None 
                  "chat.claude.ai").
         source: Optional filter -- "code" for Claude Code only,
                 "chat" for claude.ai only. Omit for both.
+        node: Optional filter by fleet node name (e.g. "kirk", "mac-studio").
 
     Returns:
-        Plain-text list: timestamp, turn count, id prefix, source, project, title.
+        Plain-text list: timestamp, turn count, id prefix, node, source, project, title.
     """
     conn = _connect()
-    sql = (
-        "SELECT id, ai_title, project, started_at, turn_count, source "
-        "FROM sessions"
-    )
+    sql = "SELECT id, ai_title, project, started_at, turn_count, source, node FROM sessions"
     params: list = []
     clauses: list = []
     if project:
@@ -223,6 +238,9 @@ def recent_sessions(n: int = 10, project: str | None = None, source: str | None 
     if source:
         clauses.append("source = ?")
         params.append(source)
+    if node:
+        clauses.append("node = ?")
+        params.append(node)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY started_at DESC LIMIT ?"
@@ -237,8 +255,9 @@ def recent_sessions(n: int = 10, project: str | None = None, source: str | None 
         ts = (r["started_at"] or "")[:19].replace("T", " ")
         title = (r["ai_title"] or "(no title)")[:60]
         src = r["source"] or "code"
+        nd = r["node"] or "local"
         out.append(
-            f"{ts}  {r['turn_count']:4d}t  {r['id'][:8]}  [{src}]  [{r['project']}]  {title}"
+            f"{ts}  {r['turn_count']:4d}t  {r['id'][:8]}  [{nd}]  [{src}]  [{r['project']}]  {title}"
         )
     return "\n".join(out)
 
@@ -276,6 +295,17 @@ def index_stats():
     else:
         embed_line = "Embeddings:    not built (run: python embed.py)"
 
+    # Per-node breakdown
+    node_rows = conn.execute(
+        "SELECT COALESCE(node, 'local') AS nd, COUNT(*) AS n FROM sessions GROUP BY nd ORDER BY n DESC"
+    ).fetchall()
+    node_parts = [f"{r['nd']}={r['n']}" for r in node_rows]
+    node_line = (
+        f"Nodes:         {', '.join(node_parts)}"
+        if node_parts
+        else "Nodes:         (none)"
+    )
+
     # SIMILAR_TO edges
     has_edges = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE name='edges'"
@@ -295,6 +325,7 @@ def index_stats():
         f"DB:            {DB_PATH} ({size_mb:.1f} MB)\n"
         f"Sessions:      {s} (code: {code_s}, chat: {chat_s})\n"
         f"Turns:         {t:,}\n"
+        f"{node_line}\n"
         f"Earliest:      {earliest}\n"
         f"Latest:        {latest}\n"
         f"{embed_line}\n"
@@ -302,7 +333,13 @@ def index_stats():
     )
 
 
-def _bfs_expand(conn, seed_ids: list[int], max_hops: int, max_turns: int, edge_types: tuple = ("TEMPORAL",)) -> set[int]:
+def _bfs_expand(
+    conn,
+    seed_ids: list[int],
+    max_hops: int,
+    max_turns: int,
+    edge_types: tuple = ("TEMPORAL",),
+) -> set[int]:
     """Walk the edge graph outward from seed turn IDs. Returns visited turn ID set."""
     visited = set(seed_ids)
     frontier = set(seed_ids)
@@ -413,7 +450,9 @@ def thread_recall(
         return "No thread data found."
 
     # Group by session, render
-    out = [f"Thread for: {query!r}  |  {len(rows)} turns from {len(seed_ids)} seed(s)\n"]
+    out = [
+        f"Thread for: {query!r}  |  {len(rows)} turns from {len(seed_ids)} seed(s)\n"
+    ]
     current_sid = None
     for r in rows:
         tid, sid, tidx, ts, role, text, title, project, started = r
@@ -450,7 +489,10 @@ def reindex() -> str:
     from pathlib import Path as _Path
     from datetime import datetime as _datetime
 
-    projects_dir = _Path.home() / ".claude" / "projects"
+    projects_dir = _Path(
+        os.environ.get("CONTINUITY_ROOT", _Path.home() / ".claude" / "projects")
+    )
+    node = os.environ.get("CONTINUITY_NODE", "local")
     if not projects_dir.exists():
         return f"Projects dir not found: {projects_dir}"
 
@@ -540,9 +582,20 @@ def reindex() -> str:
         ended = max(timestamps) if timestamps else None
         write_conn.execute(
             "INSERT INTO sessions (id, project, ai_title, cwd, started_at, ended_at, "
-            "turn_count, file_path, file_mtime, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (sid, project, ai_title, cwd, started, ended, turn_idx,
-             str(path), mtime, _datetime.now().isoformat()),
+            "turn_count, file_path, file_mtime, indexed_at, node) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid,
+                project,
+                ai_title,
+                cwd,
+                started,
+                ended,
+                turn_idx,
+                str(path),
+                mtime,
+                _datetime.now().isoformat(),
+                node,
+            ),
         )
         write_conn.commit()
         return True
@@ -594,10 +647,7 @@ def fts_integrity_check():
         conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('integrity-check')")
         return "integrity-check PASSED -- index is consistent."
     except sqlite3.OperationalError as e:
-        return (
-            f"integrity-check FAILED: {e}\n"
-            "Run fts_rebuild() to resync the index."
-        )
+        return f"integrity-check FAILED: {e}\nRun fts_rebuild() to resync the index."
 
 
 @mcp.tool()
@@ -678,20 +728,22 @@ def find_similar(query: str, limit: int = 10):
     # Hybrid re-ranking
     scored = []
     for r in rows:
-        cos_sim  = 1.0 - (r["distance"] ** 2) / 2.0
-        recency  = _recency_score(r["started_at"])
-        cplx     = min(1.0, (r["turn_count"] or 0) / _COMPLEXITY_MAX_TURNS)
-        hybrid   = _W_SEMANTIC * cos_sim + _W_RECENCY * recency + _W_COMPLEXITY * cplx
+        cos_sim = 1.0 - (r["distance"] ** 2) / 2.0
+        recency = _recency_score(r["started_at"])
+        cplx = min(1.0, (r["turn_count"] or 0) / _COMPLEXITY_MAX_TURNS)
+        hybrid = _W_SEMANTIC * cos_sim + _W_RECENCY * recency + _W_COMPLEXITY * cplx
         scored.append((hybrid, cos_sim, recency, cplx, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     scored = scored[:limit]
 
-    out = [f"Semantic matches for: {query!r}  (hybrid = 0.7*sem + 0.2*rec + 0.1*cplx)\n"]
+    out = [
+        f"Semantic matches for: {query!r}  (hybrid = 0.7*sem + 0.2*rec + 0.1*cplx)\n"
+    ]
     for hybrid, cos_sim, recency, cplx, r in scored:
-        ts    = (r["ts"] or "")[:16].replace("T", " ")
+        ts = (r["ts"] or "")[:16].replace("T", " ")
         title = (r["ai_title"] or "(no title)")[:50]
-        body  = (r["text"] or "")[:300]
+        body = (r["text"] or "")[:300]
         if len(r["text"] or "") > 300:
             body += "..."
         out.append(

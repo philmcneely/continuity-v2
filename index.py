@@ -1,13 +1,17 @@
 """Walk ~/.claude/projects/ and index every JSONL session into SQLite + FTS5."""
 
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+PROJECTS_DIR = Path(
+    os.environ.get("CONTINUITY_ROOT", Path.home() / ".claude" / "projects")
+)
 DB_PATH = Path(__file__).parent / "data" / "continuity.db"
+DEFAULT_NODE = os.environ.get("CONTINUITY_NODE", "local")
 
 
 SCHEMA = """
@@ -59,12 +63,14 @@ END;
 """
 
 
-def _ensure_source_column(conn: sqlite3.Connection) -> None:
-    """Add source column to existing DBs built before this column existed."""
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Add columns to existing DBs built before they existed."""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
     if "source" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'code'")
-        conn.commit()
+    if "node" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN node TEXT DEFAULT 'local'")
+    conn.commit()
 
 
 def extract_text(content):
@@ -94,12 +100,15 @@ def extract_text(content):
     return "\n".join(p for p in parts if p)
 
 
-def index_file(conn, path):
+def index_file(conn, path, node=None):
     sid = path.stem
     project = path.parent.name
+    node = node or DEFAULT_NODE
     mtime = path.stat().st_mtime
 
-    row = conn.execute("SELECT file_mtime FROM sessions WHERE id = ?", (sid,)).fetchone()
+    row = conn.execute(
+        "SELECT file_mtime FROM sessions WHERE id = ?", (sid,)
+    ).fetchone()
     if row and row[0] == mtime:
         return False
 
@@ -155,37 +164,67 @@ def index_file(conn, path):
         """
         INSERT INTO sessions
             (id, project, ai_title, cwd, started_at, ended_at,
-             turn_count, file_path, file_mtime, indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             turn_count, file_path, file_mtime, indexed_at, node)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (sid, project, ai_title, cwd, started, ended, turn_idx,
-         str(path), mtime, datetime.now().isoformat()),
+        (
+            sid,
+            project,
+            ai_title,
+            cwd,
+            started,
+            ended,
+            turn_idx,
+            str(path),
+            mtime,
+            datetime.now().isoformat(),
+            node,
+        ),
     )
     conn.commit()
     return True
 
 
 def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Index Claude Code JSONL sessions")
+    ap.add_argument(
+        "--root",
+        type=Path,
+        default=PROJECTS_DIR,
+        help="Root directory to scan (default: ~/.claude/projects or $CONTINUITY_ROOT)",
+    )
+    ap.add_argument(
+        "--node",
+        default=DEFAULT_NODE,
+        help="Node name tag for indexed sessions (default: 'local' or $CONTINUITY_NODE)",
+    )
+    args = ap.parse_args()
+
+    root = args.root
+    node = args.node
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
-    _ensure_source_column(conn)
+    _ensure_columns(conn)
 
-    if not PROJECTS_DIR.exists():
-        print(f"Projects dir not found: {PROJECTS_DIR}", file=sys.stderr)
+    if not root.exists():
+        print(f"Projects dir not found: {root}", file=sys.stderr)
         return 1
 
     new_count = 0
     skip_count = 0
     err_count = 0
 
-    for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
+    for jsonl in root.rglob("*.jsonl"):
         try:
-            if index_file(conn, jsonl):
+            if index_file(conn, jsonl, node=node):
                 new_count += 1
-                print(f"  indexed: {jsonl.parent.name}/{jsonl.name}")
+                print(f"  [{node}] indexed: {jsonl.parent.name}/{jsonl.name}")
             else:
                 skip_count += 1
         except Exception as exc:

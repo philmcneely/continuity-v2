@@ -28,8 +28,10 @@ def recall(session_id, idx_from=None, idx_to=None):
         return 1
 
     sid = s["id"]
+    nd = s["node"] if "node" in s.keys() else "local"
     print(f"=== {s['ai_title'] or '(no title)'} ===")
     print(f"session: {sid}")
+    print(f"node:    {nd}")
     print(f"project: {s['project']}  cwd: {s['cwd']}")
     print(f"started: {s['started_at']}  ended: {s['ended_at']}")
     print(f"turns:   {s['turn_count']}")

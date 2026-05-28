@@ -11,7 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
 DB_PATH = Path(__file__).parent / "data" / "continuity.db"
 
 
-def search(query, limit=10, project=None):
+def search(query, limit=10, project=None, node=None):
     if not DB_PATH.exists():
         print(f"DB not found: {DB_PATH}\nRun: python index.py", file=sys.stderr)
         return 1
@@ -22,7 +22,7 @@ def search(query, limit=10, project=None):
     sql = """
         SELECT
             t.id, t.session_id, t.turn_idx, t.ts, t.role, t.text,
-            s.project, s.ai_title,
+            s.project, s.ai_title, s.node,
             snippet(turns_fts, 0, '>>>', '<<<', '...', 24) AS snip
         FROM turns_fts
         JOIN turns t ON t.id = turns_fts.rowid
@@ -33,6 +33,9 @@ def search(query, limit=10, project=None):
     if project:
         sql += " AND s.project LIKE ?"
         params.append(f"%{project}%")
+    if node:
+        sql += " AND s.node = ?"
+        params.append(node)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
 
@@ -45,7 +48,8 @@ def search(query, limit=10, project=None):
     for r in rows:
         title = r["ai_title"] or "(no title)"
         ts = (r["ts"] or "")[:19].replace("T", " ")
-        print(f"\n[{ts}] {r['role']:9} | {r['project']} | {title}")
+        nd = r["node"] or "local"
+        print(f"\n[{ts}] {r['role']:9} | {nd} | {r['project']} | {title}")
         print(f"  session: {r['session_id']}  turn: {r['turn_idx']}")
         print(f"  {r['snip']}")
 
@@ -58,8 +62,9 @@ def main():
     ap.add_argument("query", help="FTS5 query (supports AND/OR/NOT, quotes, prefix*)")
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--project", help="filter by project name substring")
+    ap.add_argument("--node", help="filter by fleet node name")
     args = ap.parse_args()
-    return search(args.query, args.limit, args.project)
+    return search(args.query, args.limit, args.project, args.node)
 
 
 if __name__ == "__main__":
