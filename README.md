@@ -127,17 +127,83 @@ To get your claude.ai chat export: claude.ai -> Settings -> Export data.
 
 Tools exposed:
 
-- `search_sessions(query, limit=10, project=None, source=None)` -- FTS5 search with snippets
+- `search_sessions(query, limit=10, project=None, source=None, node=None)` -- FTS5 search with snippets
 - `find_similar(query, limit=10)` -- semantic search, hybrid-scored (0.7 sem + 0.2 recency + 0.1 complexity)
 - `thread_recall(query, ...)` -- BFS over TEMPORAL edges; returns narrative thread not just rows
 - `recall_session(session_id, idx_from=None, idx_to=None)` -- full or sliced replay
-- `recent_sessions(n=10, project=None, source=None)` -- list recent sessions
-- `index_stats()` -- DB health, session/turn counts, embedding coverage, edge counts
-- `reindex()` -- re-index new sessions without restarting the server
+- `recent_sessions(n=10, project=None, source=None, node=None)` -- list recent sessions
+- `index_stats()` -- DB health, session/turn counts, embedding coverage, edge counts, per-node breakdown
+- `reindex()` -- re-index new sessions without restarting the server (respects `CONTINUITY_ROOT`/`CONTINUITY_NODE` env vars)
 
 The `source` param accepts `"code"` (Claude Code only) or `"chat"` (claude.ai only). Omit for both.
 
 Restart Claude Code to load the server.
+
+
+### Fleet / Multi-Node Support
+
+If you run Claude Code on multiple machines, you can centralize all sessions into a single index with per-node tagging.
+
+**How it works:**
+
+```
+Machine A (kirk)        Machine B (mac-studio)       Machine C (hal9000)
+~/.claude/projects/     ~/.claude/projects/          ~/.claude/projects/
+        ↓  rsync                ↓  rsync                     ↓  rsync
+        └───────────────────────┴─────────────────────────────┘
+                                ↓
+                Central store:  /Volumes/Data/continuity-sessions/
+                    kirk/           ← mirrored from A
+                    mac-studio/     ← mirrored from B
+                    hal9000/        ← mirrored from C
+                                ↓
+                python index.py --root <central-store>/kirk --node kirk
+                python index.py --root <central-store>/mac-studio --node mac-studio
+                                ↓
+                        Single continuity.db
+                        (all nodes, all sessions)
+```
+
+**Environment variables:**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CONTINUITY_ROOT` | `~/.claude/projects` | Root directory to scan for JSONL files |
+| `CONTINUITY_NODE` | `local` | Node name tag applied to indexed sessions |
+
+**CLI usage:**
+
+```bash
+# Index from a specific root with a node tag
+python index.py --root /Volumes/Data/continuity-sessions/kirk --node kirk
+
+# Search filtered by node
+python search.py "auth middleware" --node kirk
+
+# MCP tools accept node= parameter too
+# search_sessions(query="auth", node="kirk")
+# recent_sessions(n=10, node="mac-studio")
+```
+
+**Sync script:**
+
+`sync-fleet.sh` rsyncs JSONL files from configured nodes to a central store, then indexes each:
+
+```bash
+./sync-fleet.sh              # sync all configured nodes
+./sync-fleet.sh kirk         # sync one node
+```
+
+Edit the `NODES` associative array in the script to add your machines. Set `CONTINUITY_CENTRAL_STORE` env var or edit the default path.
+
+**Coexistence with single-node setup:** The fleet setup is additive. A single-machine install with no env vars works exactly as before (node defaults to `"local"`). The `node` column is auto-added to existing DBs on first run via schema migration.
+
+**`index_stats()` output** now includes a per-node breakdown:
+
+```
+Sessions:      659 (code: 655, chat: 4)
+Nodes:         kirk=659
+```
 
 
 ## Hooks: installation
