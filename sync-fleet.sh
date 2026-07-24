@@ -26,14 +26,27 @@ SSH_KEY="${CONTINUITY_SSH_KEY:-$HOME/git/claude-agent/keys/maxwellsmart}"
 # Only kirk and mac-studio were listed before, so even with working syntax the
 # other six nodes were never going to sync.
 FLEET="
-kirk|localhost|-|-
+kirk|192.168.1.77|maxwellsmart|/Users/philmcneely
 scotty|192.168.1.41|maxwellsmart|/Users/philmcneely
 max|192.168.1.33|maxwellsmart|/home/philmcneely
 spock|192.168.1.53|maxwellsmart|/Users/philmcneely
 mccoy|192.168.1.52|maxwellsmart|/Users/philmcneely
 beelink|192.168.1.10|maxwellsmart|/home/philmcneely
 hal9000|192.168.0.225|philmcneely|/home/philmcneely
+mac-studio|192.168.0.240|philmcneely|/Users/philmcneely
 "
+
+# Whether a node's address belongs to the machine we are running on. Nodes were
+# previously identified by the literal string "localhost", which silently meant
+# a different machine once this script moved to Mac Studio — Kirk stopped being
+# synced and nobody would have noticed until the next time it mattered.
+is_local_host() {
+    local addr="$1"
+    [ "$addr" = "localhost" ] && return 0
+    ifconfig 2>/dev/null | grep -qw "$addr" && return 0
+    [ "$addr" = "$(hostname -s)" ] && return 0
+    return 1
+}
 
 node_field() {
     # node_field <node> <1-based field index>
@@ -49,7 +62,7 @@ sync_node() {
 
     mkdir -p "$dest"
 
-    if [[ "$host" == "localhost" ]]; then
+    if is_local_host "$host"; then
         rsync -a --include='*/' --include='*.jsonl' --exclude='*' \
             "$HOME/${CLAUDE_PROJECTS}/" "$dest/"
     else
