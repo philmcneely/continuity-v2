@@ -70,11 +70,18 @@ sync_node() {
     else
         local user; user="$(node_field "$node" 3)"
         local rhome; rhome="$(node_field "$node" 4)"
-        # --rsync-path elevates on the far side so maxwellsmart can read files
-        # owned by philmcneely. Harmless when already the owner.
+        # Elevate on the far side only when the SSH user does not already own
+        # the transcripts. Max runs Claude Code as maxwellsmart, so sudo-ing to
+        # philmcneely there reads a directory that user cannot see and fails
+        # with rc=23 — a partial-transfer code that looks like a permissions
+        # blip rather than "wrong user entirely".
+        local rsync_path=()
+        if [ "$rhome" != "/Users/${user}" ] && [ "$rhome" != "/home/${user}" ]; then
+            rsync_path=(--rsync-path="sudo -u philmcneely rsync")
+        fi
         rsync -az \
             -e "ssh -i $SSH_KEY -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s" \
-            --rsync-path="sudo -u philmcneely rsync" \
+            "${rsync_path[@]}" \
             --include='*/' --include='*.jsonl' --exclude='*' \
             "${user}@${host}:${rhome}/${CLAUDE_PROJECTS}/" "$dest/"
     fi
