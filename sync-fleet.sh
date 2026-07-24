@@ -28,13 +28,15 @@ SSH_KEY="${CONTINUITY_SSH_KEY:-$HOME/git/claude-agent/keys/maxwellsmart}"
 FLEET="
 kirk|192.168.1.77|maxwellsmart|/Users/philmcneely
 scotty|192.168.1.41|maxwellsmart|/Users/philmcneely
-max|192.168.1.33|maxwellsmart|/home/philmcneely
+max|192.168.1.33|maxwellsmart|/home/maxwellsmart
 spock|192.168.1.53|maxwellsmart|/Users/philmcneely
 mccoy|192.168.1.52|maxwellsmart|/Users/philmcneely
 beelink|192.168.1.10|maxwellsmart|/home/philmcneely
 hal9000|192.168.0.225|philmcneely|/home/philmcneely
-mac-studio|192.168.0.240|philmcneely|/Users/philmcneely
 "
+# mac-studio is deliberately absent: it serves inference but never runs Claude
+# Code, so it has no ~/.claude/projects and listing it only produced a
+# permanent rsync failure that masked real ones.
 
 # Whether a node's address belongs to the machine we are running on. Nodes were
 # previously identified by the literal string "localhost", which silently meant
