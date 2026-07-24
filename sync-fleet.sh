@@ -70,7 +70,12 @@ sync_node() {
     # A node with no ~/.claude/projects has simply not hosted a session yet.
     # That is an ordinary state for an inference host, so report it and move on
     # rather than returning a failure that would drown out a real one.
-    if ! is_local_host "$host"; then
+    if is_local_host "$host"; then
+        if [ ! -d "$HOME/${CLAUDE_PROJECTS}" ]; then
+            echo "[sync] $node — no transcripts (node has not hosted a session)"
+            return 0
+        fi
+    else
         local u; u="$(node_field "$node" 3)"
         local h; h="$(node_field "$node" 4)"
         if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
