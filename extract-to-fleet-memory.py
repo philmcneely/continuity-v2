@@ -118,6 +118,12 @@ def extract_facts_via_llm(transcript):
             LLM_URL,
             "-H",
             "Content-Type: application/json",
+            # Identify this job to the proxy so Switchboard can attribute its
+            # spend. It runs every 2h over every new session, so it is a real
+            # recurring cost — without this header it lands under "curl" and
+            # becomes indistinguishable from every other ad-hoc call.
+            "-H",
+            "X-Caller: fact-extraction",
             "-d",
             payload,
         ],
