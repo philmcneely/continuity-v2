@@ -75,13 +75,18 @@ sync_node() {
         # philmcneely there reads a directory that user cannot see and fails
         # with rc=23 — a partial-transfer code that looks like a permissions
         # blip rather than "wrong user entirely".
-        local rsync_path=()
+        # Plain string, not an array: bash 3.2 treats an empty array expanded
+        # under `set -u` as an unbound variable, which is the same class of
+        # failure as the `declare -A` bug that kept this script from ever
+        # running. Word-splitting is safe here — no path in the value.
+        local rsync_path=""
         if [ "$rhome" != "/Users/${user}" ] && [ "$rhome" != "/home/${user}" ]; then
-            rsync_path=(--rsync-path="sudo -u philmcneely rsync")
+            rsync_path="--rsync-path=sudo -u philmcneely rsync"
         fi
+        # shellcheck disable=SC2086
         rsync -az \
             -e "ssh -i $SSH_KEY -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s" \
-            "${rsync_path[@]}" \
+            ${rsync_path:+"$rsync_path"} \
             --include='*/' --include='*.jsonl' --exclude='*' \
             "${user}@${host}:${rhome}/${CLAUDE_PROJECTS}/" "$dest/"
     fi
