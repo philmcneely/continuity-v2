@@ -33,10 +33,13 @@ spock|192.168.1.53|maxwellsmart|/Users/philmcneely
 mccoy|192.168.1.52|maxwellsmart|/Users/philmcneely
 beelink|192.168.1.10|maxwellsmart|/home/philmcneely
 hal9000|192.168.0.225|philmcneely|/home/philmcneely
+mac-studio|192.168.0.240|philmcneely|/Users/philmcneely
 "
-# mac-studio is deliberately absent: it serves inference but never runs Claude
-# Code, so it has no ~/.claude/projects and listing it only produced a
-# permanent rsync failure that masked real ones.
+# Every fleet node is listed, including ones that mostly serve inference.
+# Any box can host a Claude session — you spin one up precisely on the machine
+# you are debugging — so a node with no transcripts today is normal, not
+# absent. Missing ~/.claude/projects is reported as "no transcripts" rather
+# than counted as a failure, so real failures stay visible.
 
 # Whether a node's address belongs to the machine we are running on. Nodes were
 # previously identified by the literal string "localhost", which silently meant
@@ -63,6 +66,19 @@ sync_node() {
     local dest="${CENTRAL_STORE}/${node}"
 
     mkdir -p "$dest"
+
+    # A node with no ~/.claude/projects has simply not hosted a session yet.
+    # That is an ordinary state for an inference host, so report it and move on
+    # rather than returning a failure that would drown out a real one.
+    if ! is_local_host "$host"; then
+        local u; u="$(node_field "$node" 3)"
+        local h; h="$(node_field "$node" 4)"
+        if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+             "${u}@${host}" "test -d '${h}/${CLAUDE_PROJECTS}'" 2>/dev/null; then
+            echo "[sync] $node — no transcripts (node has not hosted a session)"
+            return 0
+        fi
+    fi
 
     if is_local_host "$host"; then
         rsync -a --include='*/' --include='*.jsonl' --exclude='*' \
