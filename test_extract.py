@@ -26,10 +26,18 @@ _spec.loader.exec_module(etfm)
 # ---------------------------------------------------------------------------
 
 def _ok_subprocess():
-    """Return a mock subprocess result indicating success."""
+    """Return a mock subprocess result indicating a fresh store."""
     m = MagicMock()
     m.returncode = 0
-    m.stdout = '{"id": "mem-1"}'
+    m.stdout = '{"success": true, "message": "Memory stored successfully", "content_hash": "abc123"}'
+    return m
+
+
+def _duplicate_subprocess():
+    """Return a mock subprocess result indicating the server rejected a dup."""
+    m = MagicMock()
+    m.returncode = 0
+    m.stdout = '{"success": false, "message": "Duplicate content detected (exact match)", "content_hash": "abc123"}'
     return m
 
 
@@ -49,12 +57,24 @@ class TestStoreInFleetMemory(unittest.TestCase):
             "tags": ["sqlite", "continuity"],
         }
         result = etfm.store_in_fleet_memory(fact, "session-abc", "kirk")
-        self.assertTrue(result)
+        self.assertEqual(result, "stored")
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         payload_str = cmd[cmd.index("-d") + 1]
         self.assertIn("[decision]", payload_str)
         self.assertIn("Use WAL mode", payload_str)
+
+    @patch.object(etfm.subprocess, "run")
+    def test_duplicate_content_reported_not_counted_as_stored(self, mock_run):
+        """A server-side exact-match duplicate must surface as 'duplicate', not 'stored'."""
+        mock_run.return_value = _duplicate_subprocess()
+        fact = {
+            "type": "config",
+            "fact": "Fleet memory listens on 192.168.0.225:8766.",
+            "tags": [],
+        }
+        result = etfm.store_in_fleet_memory(fact, "session-abc", "kirk")
+        self.assertEqual(result, "duplicate")
 
     @patch.object(etfm.subprocess, "run")
     def test_missing_type_uses_unknown(self, mock_run):
@@ -65,7 +85,7 @@ class TestStoreInFleetMemory(unittest.TestCase):
             "tags": ["fleet-memory"],
         }
         result = etfm.store_in_fleet_memory(fact, "session-def", "beelink")
-        self.assertTrue(result)
+        self.assertEqual(result, "stored")
         cmd = mock_run.call_args[0][0]
         payload_str = cmd[cmd.index("-d") + 1]
         self.assertIn("[unknown]", payload_str)
@@ -80,7 +100,7 @@ class TestStoreInFleetMemory(unittest.TestCase):
             "tags": ["orphaned"],
         }
         result = etfm.store_in_fleet_memory(fact, "session-ghi", "hal9000")
-        self.assertFalse(result)
+        self.assertEqual(result, "failed")
         mock_run.assert_not_called()
 
     @patch.object(etfm.subprocess, "run")
@@ -89,8 +109,23 @@ class TestStoreInFleetMemory(unittest.TestCase):
         mock_run.return_value = _ok_subprocess()
         fact = {"type": "outcome", "fact": "", "tags": []}
         result = etfm.store_in_fleet_memory(fact, "session-jkl", "kirk")
-        self.assertFalse(result)
+        self.assertEqual(result, "failed")
         mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for extract_facts_via_llm() timeout resilience
+# ---------------------------------------------------------------------------
+
+class TestExtractFactsViaLlmTimeout(unittest.TestCase):
+
+    @patch.object(etfm.subprocess, "run")
+    def test_timeout_returns_empty_list_not_raise(self, mock_run):
+        """A slow/overloaded model must not crash the run — one session's
+        timeout used to take down every other session in the same batch."""
+        mock_run.side_effect = etfm.subprocess.TimeoutExpired(cmd="curl", timeout=120)
+        result = etfm.extract_facts_via_llm("some transcript")
+        self.assertEqual(result, [])
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +162,13 @@ class TestMainLoopQuarantineGuard(unittest.TestCase):
         conn_mock.execute.return_value = conn_mock
         mock_sqlite.connect.return_value = conn_mock
 
-        mock_load_state.return_value = {"last_extracted": {}}
+        mock_load_state.return_value = {"last_extracted": {}, "last_extracted_turn_idx": {}}
 
         mock_sessions.return_value = [
             ("sess-001", "Test Session", "kirk", "2026-07-01", "2026-07-01", 8)
         ]
-        mock_text.return_value = "A" * 300  # long enough to pass the length check
+        # (transcript, last_turn_idx_included) — long enough to pass the length check
+        mock_text.return_value = ("A" * 300, 7)
 
         # Mix: good, missing-type, quarantine (missing both), missing-fact
         mock_extract.return_value = [

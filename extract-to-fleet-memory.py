@@ -19,9 +19,20 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "data" / "continuity.db"
 STATE_FILE = Path(__file__).parent / "data" / "extraction-state.json"
-FLEET_MEMORY_URL = os.environ.get("FLEET_MEMORY_URL", "http://192.168.0.240:8766")
+# NOTE: fleet memory moved to HAL (see continuity-pipeline.sh); .240 is a
+# different, unrelated mcp-memory instance. Keep this default in sync with
+# the pipeline's export so a standalone/manual run doesn't silently write
+# to the wrong store.
+FLEET_MEMORY_URL = os.environ.get("FLEET_MEMORY_URL", "http://192.168.0.225:8766")
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:3020/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "auto")
+
+# Safety valves so a long backlog (e.g. first run after deploying the
+# incremental fix, or a fleet node coming back after an outage) can't
+# stampede the LLM or flood fleet memory in one run.
+MAX_CHARS_PER_BATCH = 12000
+MAX_TURNS_PER_BATCH = 150
+MAX_SESSIONS_PER_RUN = 40
 
 EXTRACTION_PROMPT = """You are a knowledge extractor. Given a conversation transcript between a user (Phil) and an AI assistant, extract ONLY facts worth remembering for future sessions.
 
@@ -52,8 +63,45 @@ TRANSCRIPT:
 
 def load_state():
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"last_extracted": {}}
+        state = json.loads(STATE_FILE.read_text())
+    else:
+        state = {"last_extracted": {}}
+    # "last_extracted" (legacy) marks a session fully SKIPPED forever after
+    # one pass — that's the bug: a session alive for weeks only ever got its
+    # first ~12000 chars looked at, then was never revisited. The new key
+    # tracks the highest turn_idx already extracted per session, so growth
+    # keeps getting picked up incrementally instead of the session going dark.
+    state.setdefault("last_extracted_turn_idx", {})
+    return state
+
+
+def migrate_legacy_state(conn, state):
+    """One-time backfill for the old session-level skip list.
+
+    For sessions the legacy code already touched at least once, seed their
+    turn_idx marker at their CURRENT max turn_idx (i.e. "caught up as of
+    now"). This deliberately does NOT retroactively re-extract everything
+    those sessions ever said — that would stampede the LLM and flood fleet
+    memory with facts from months of already-reviewed history. It just stops
+    them from being skipped forever: any turn added AFTER this migration
+    point gets picked up on the next run that sees it.
+    """
+    legacy = state.get("last_extracted", {})
+    marker = state["last_extracted_turn_idx"]
+    migrated = 0
+    for sid in legacy:
+        if sid in marker:
+            continue
+        row = conn.execute(
+            "SELECT turn_count FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        if not row:
+            continue
+        marker[sid] = row[0] - 1  # turn_idx is 0-based
+        migrated += 1
+    if migrated:
+        print(f"Migrated {migrated} legacy session markers to turn-incremental tracking")
+    return state
 
 
 def save_state(state):
@@ -78,24 +126,43 @@ def get_recent_sessions(conn, hours=24, session_id=None):
     ).fetchall()
 
 
-def get_session_text(conn, session_id, max_chars=12000):
+def get_session_text(
+    conn,
+    session_id,
+    since_turn_idx=-1,
+    max_chars=MAX_CHARS_PER_BATCH,
+    max_turns=MAX_TURNS_PER_BATCH,
+):
+    """Return (transcript_text, last_turn_idx_included) for turns AFTER since_turn_idx.
+
+    Turn indices are stable across reindexes (transcripts are append-only, and
+    index.py re-numbers from 0 in file order each time), so "last extracted
+    turn_idx" is a safe incremental watermark. Bounded by max_chars/max_turns
+    per run; last_turn_idx_included reflects exactly what was sent to the LLM
+    so the caller can advance the marker without skipping anything, even if a
+    session has a large backlog that takes several runs to fully catch up on.
+    """
     turns = conn.execute(
-        "SELECT role, text FROM turns WHERE session_id = ? ORDER BY turn_idx",
-        (session_id,),
+        "SELECT turn_idx, role, text FROM turns WHERE session_id = ? AND turn_idx > ? "
+        "ORDER BY turn_idx",
+        (session_id, since_turn_idx),
     ).fetchall()
 
     lines = []
     total = 0
-    for role, text in turns:
+    last_idx = since_turn_idx
+    for turn_idx, role, text in turns:
         if not text or len(text.strip()) < 10:
+            last_idx = turn_idx
             continue
         chunk = text[:2000]
-        if total + len(chunk) > max_chars:
+        if total + len(chunk) > max_chars or len(lines) >= max_turns:
             break
         lines.append(f"[{role}]: {chunk}")
         total += len(chunk)
+        last_idx = turn_idx
 
-    return "\n\n".join(lines)
+    return "\n\n".join(lines), last_idx
 
 
 def extract_facts_via_llm(transcript):
@@ -109,28 +176,36 @@ def extract_facts_via_llm(transcript):
         }
     )
 
-    result = subprocess.run(
-        [
-            "curl",
-            "-s",
-            "-X",
-            "POST",
-            LLM_URL,
-            "-H",
-            "Content-Type: application/json",
-            # Identify this job to the proxy so Switchboard can attribute its
-            # spend. It runs every 2h over every new session, so it is a real
-            # recurring cost — without this header it lands under "curl" and
-            # becomes indistinguishable from every other ad-hoc call.
-            "-H",
-            "X-Caller: fact-extraction",
-            "-d",
-            payload,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "-X",
+                "POST",
+                LLM_URL,
+                "-H",
+                "Content-Type: application/json",
+                # Identify this job to the proxy so Switchboard can attribute its
+                # spend. It runs every 2h over every new session, so it is a real
+                # recurring cost — without this header it lands under "curl" and
+                # becomes indistinguishable from every other ad-hoc call.
+                "-H",
+                "X-Caller: fact-extraction",
+                "-d",
+                payload,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        # A single slow/overloaded model must not take down the whole run —
+        # one session timing out used to crash main() before it reached any
+        # of the other sessions in the batch, i.e. one bad LLM call could
+        # zero out an entire run's stored-fact count.
+        print("  LLM request timed out after 120s, skipping this batch", file=sys.stderr)
+        return []
 
     if result.returncode != 0:
         print(f"  LLM request failed: {result.stderr[:200]}", file=sys.stderr)
@@ -150,11 +225,20 @@ def extract_facts_via_llm(transcript):
 
 
 def store_in_fleet_memory(fact, session_id, node):
+    """Store one fact. Returns 'stored', 'duplicate', or 'failed'.
+
+    Fleet memory rejects exact-content duplicates server-side (content-hash
+    match) — we surface that as 'duplicate' rather than counting it as a
+    fresh store, so run-over-run counts stay honest. This is a safety net,
+    not the primary defense: turn-incremental extraction (see
+    get_session_text) means the same turns are never re-sent to the LLM,
+    which is what actually keeps re-extraction from happening at all.
+    """
     fact_type = fact.get("type", "unknown")
     fact_text = fact.get("fact", "")
     if not fact_text:
         print(f"  SKIP: fact missing 'fact' field: {fact!r}", file=sys.stderr)
-        return False
+        return "failed"
     memory_content = f"[{fact_type}] {fact_text}"
     tags = fact.get("tags", [])
     tags.extend(["continuity-extract", f"node:{node}"])
@@ -189,7 +273,22 @@ def store_in_fleet_memory(fact, session_id, node):
         timeout=30,
     )
 
-    return result.returncode == 0
+    if result.returncode != 0:
+        return "failed"
+
+    try:
+        resp = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        # Older mock/backend that just returns an opaque id — treat any
+        # 2xx-shaped curl success without a parseable body as stored, to
+        # avoid breaking against a backend that doesn't send "success".
+        return "stored"
+
+    if resp.get("success") is False:
+        if "duplicate" in resp.get("message", "").lower():
+            return "duplicate"
+        return "failed"
+    return "stored"
 
 
 def main():
@@ -203,6 +302,12 @@ def main():
     )
     ap.add_argument("--session", type=str, help="Extract from a specific session ID")
     ap.add_argument("--dry-run", action="store_true", help="Extract but don't store")
+    ap.add_argument(
+        "--max-sessions",
+        type=int,
+        default=MAX_SESSIONS_PER_RUN,
+        help=f"Cap sessions with new turns processed per run (default: {MAX_SESSIONS_PER_RUN})",
+    )
     args = ap.parse_args()
 
     if not DB_PATH.exists():
@@ -213,26 +318,42 @@ def main():
     conn.execute("PRAGMA journal_mode=WAL")
 
     state = load_state()
+    state = migrate_legacy_state(conn, state)
+    markers = state["last_extracted_turn_idx"]
     sessions = get_recent_sessions(conn, hours=args.hours, session_id=args.session)
 
-    print(f"Found {len(sessions)} sessions to process")
+    print(f"Found {len(sessions)} sessions in window")
 
     total_facts = 0
     total_stored = 0
+    total_duplicate = 0
+    total_failed = 0
+    processed = 0
 
     for sid, title, node, started, ended, turns in sessions:
-        if sid in state["last_extracted"] and not args.session:
-            print(f"  SKIP {sid[:12]} (already extracted)")
+        max_idx = turns - 1  # turn_idx is 0-based, contiguous per session
+        last_done = markers.get(sid, -1)
+
+        if not args.session and last_done >= max_idx:
+            print(f"  SKIP {sid[:12]} (no new turns past idx {last_done})")
             continue
 
+        if processed >= args.max_sessions:
+            print(f"  SKIP {sid[:12]} (hit --max-sessions {args.max_sessions} for this run, will pick up next run)")
+            continue
+        processed += 1
+
+        since = -1 if args.session else last_done
+        new_turn_count = max_idx - since
         print(
-            f"  Processing: {sid[:12]} [{node}] {title or 'untitled'} ({turns} turns)"
+            f"  Processing: {sid[:12]} [{node}] {title or 'untitled'} "
+            f"({new_turn_count} new turns since idx {since})"
         )
 
-        transcript = get_session_text(conn, sid)
+        transcript, last_idx = get_session_text(conn, sid, since_turn_idx=since)
         if len(transcript) < 200:
             print(f"    Too short, skipping")
-            state["last_extracted"][sid] = datetime.now().isoformat()
+            markers[sid] = last_idx
             continue
 
         facts = extract_facts_via_llm(transcript)
@@ -250,18 +371,28 @@ def main():
                 print(f"    [{fact.get('type', 'unknown')}] {fact.get('fact', '')}")
                 print(f"      tags: {fact.get('tags', [])}")
             else:
-                if store_in_fleet_memory(fact, sid, node or "unknown"):
+                status = store_in_fleet_memory(fact, sid, node or "unknown")
+                label = fact.get('fact', '')[:80]
+                if status == "stored":
                     total_stored += 1
-                    print(f"    STORED: [{fact.get('type', 'unknown')}] {fact.get('fact', '')[:80]}")
+                    print(f"    STORED: [{fact.get('type', 'unknown')}] {label}")
+                elif status == "duplicate":
+                    total_duplicate += 1
+                    print(f"    DUPLICATE (already in fleet memory): [{fact.get('type', 'unknown')}] {label}")
                 else:
-                    print(f"    FAILED: [{fact.get('type', 'unknown')}] {fact.get('fact', '')[:80]}")
+                    total_failed += 1
+                    print(f"    FAILED: [{fact.get('type', 'unknown')}] {label}")
 
-        state["last_extracted"][sid] = datetime.now().isoformat()
+        if not args.dry_run:
+            markers[sid] = last_idx
 
     if not args.dry_run:
         save_state(state)
 
-    print(f"\nDone. Facts extracted: {total_facts}, stored: {total_stored}")
+    print(
+        f"\nDone. Facts extracted: {total_facts}, stored: {total_stored} "
+        f"(duplicates: {total_duplicate}, failed: {total_failed})"
+    )
     return 0
 
 
