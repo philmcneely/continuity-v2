@@ -23,6 +23,8 @@ import sqlite_vec
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 
+from fts_query import fts_safe
+
 # MCP clients parse stdout as JSON-RPC; keep stderr quiet.
 logging.disable(logging.WARNING)
 
@@ -117,7 +119,7 @@ def search_sessions(
         JOIN sessions s ON s.id = t.session_id
         WHERE turns_fts MATCH ?
     """
-    params: list = [query]
+    params: list = [fts_safe(query)]
     if project:
         sql += " AND s.project LIKE ?"
         params.append(f"%{project}%")
@@ -409,7 +411,7 @@ def thread_recall(
         LIMIT ?
     """
     try:
-        seeds = conn.execute(seed_sql, [query, seed_limit]).fetchall()
+        seeds = conn.execute(seed_sql, [fts_safe(query), seed_limit]).fetchall()
     except sqlite3.OperationalError as e:
         return f"FTS5 error: {e}"
 

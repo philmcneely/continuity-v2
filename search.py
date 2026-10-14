@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from fts_query import fts_safe
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -29,7 +31,7 @@ def search(query, limit=10, project=None, node=None):
         JOIN sessions s ON s.id = t.session_id
         WHERE turns_fts MATCH ?
     """
-    params = [query]
+    params = [fts_safe(query)]
     if project:
         sql += " AND s.project LIKE ?"
         params.append(f"%{project}%")
