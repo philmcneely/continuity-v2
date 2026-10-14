@@ -23,7 +23,7 @@ import sqlite_vec
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 
-from fts_query import fts_safe
+from fts_query import fts_fallback, fts_safe
 
 # MCP clients parse stdout as JSON-RPC; keep stderr quiet.
 logging.disable(logging.WARNING)
@@ -134,11 +134,12 @@ def search_sessions(
 
     try:
         rows = list(conn.execute(sql, params))
-    except sqlite3.OperationalError as e:
-        return (
-            f"FTS5 syntax error: {e}\n"
-            "Hyphens and numbers need double quotes, e.g. '\"gold-402\" distribution'."
-        )
+    except sqlite3.OperationalError:
+        params[0] = fts_fallback(query)  # malformed operators typed: retry every token literally
+        try:
+            rows = list(conn.execute(sql, params)) if params[0] else []
+        except sqlite3.OperationalError as e:
+            return f"FTS5 syntax error: {e}"
 
     if not rows:
         return "No matches."
@@ -412,8 +413,12 @@ def thread_recall(
     """
     try:
         seeds = conn.execute(seed_sql, [fts_safe(query), seed_limit]).fetchall()
-    except sqlite3.OperationalError as e:
-        return f"FTS5 error: {e}"
+    except sqlite3.OperationalError:
+        try:
+            fb = fts_fallback(query)
+            seeds = conn.execute(seed_sql, [fb, seed_limit]).fetchall() if fb else []
+        except sqlite3.OperationalError as e:
+            return f"FTS5 error: {e}"
 
     if not seeds:
         return "No matches found."
